@@ -1,7 +1,10 @@
 import os
-import json
 import re
 import logging
+import datetime
+import threading
+from flask import Flask
+from pymongo import MongoClient
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
@@ -13,28 +16,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── config ──────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-CHANNEL_ID  = os.environ["CHANNEL_ID"]          # e.g. -1001234567890
-INDEX_FILE  = "index.json"
+BOT_TOKEN   = os.environ.get("BOT_TOKEN")
+CHANNEL_ID  = os.environ.get("CHANNEL_ID")
+MONGO_URI   = os.environ.get("MONGO_URI")
+
+# ── database setup ──────────────────────────────────────────────────────────
+client = MongoClient(MONGO_URI)
+db = client["poem_database"]
+collection = db["index_data"]
+
+# ── web server disguise ─────────────────────────────────────────────────────
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Bot is alive and monitoring the channel!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def load_index() -> dict:
-    if os.path.exists(INDEX_FILE):
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"message_id": None, "poems": []}
+    data = collection.find_one({"_id": "main_index"})
+    if data:
+        return data
+    return {"_id": "main_index", "message_id": None, "poems": []}
 
 def save_index(data: dict):
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    collection.update_one({"_id": "main_index"}, {"$set": data}, upsert=True)
 
 def parse_poem(text: str) -> dict | None:
-    """
-    Expected format anywhere in the message:
-        #عنوان:اسم_القصيدة  #شاعر:اسم_الشاعر  #وسم:وسم1،وسم2
-    Tags separator can be comma or Arabic comma.
-    Returns None if any required field is missing.
-    """
     title_m  = re.search(r"#عنوان[:\s]+([^\s#]+)", text)
     poet_m   = re.search(r"#شاعر[:\s]+([^\s#]+)", text)
     tags_raw = re.findall(r"#وسم[:\s]+([^\s#]+)", text)
@@ -52,7 +64,6 @@ def parse_poem(text: str) -> dict | None:
     return {"title": title, "poet": poet, "tags": tags}
 
 def build_index_text(poems: list) -> str:
-    """Builds the Arabic index message."""
     if not poems:
         return "📚 *فهرس القصائد*\n\n_لم تُضَف قصائد بعد._"
 
@@ -65,7 +76,7 @@ def build_index_text(poems: list) -> str:
             line += f"\n    {tags_str}"
         lines.append(line)
 
-    lines.append(f"\n_آخر تحديث: {__import__('datetime').datetime.now().strftime('%Y-%m-%d')}_")
+    lines.append(f"\n_آخر تحديث: {datetime.datetime.now().strftime('%Y-%m-%d')}_")
     return "\n".join(lines)
 
 # ── handler ───────────────────────────────────────────────────────────────────
@@ -74,13 +85,12 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    # Only act on messages from our channel
     if str(msg.chat.id) != str(CHANNEL_ID):
         return
 
     poem = parse_poem(msg.text)
     if not poem:
-        return  # message has no poem metadata — ignore silently
+        return
 
     poem["link"] = f"https://t.me/c/{str(CHANNEL_ID).replace('-100', '')}/{msg.message_id}"
 
@@ -92,7 +102,6 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if data["message_id"]:
-            # Update existing index message
             await context.bot.edit_message_text(
                 chat_id=CHANNEL_ID,
                 message_id=data["message_id"],
@@ -100,9 +109,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
-            logger.info(f"Index updated — now {len(data['poems'])} poem(s).")
         else:
-            # First time: send a new message and pin it
             sent = await context.bot.send_message(
                 chat_id=CHANNEL_ID,
                 text=index_text,
@@ -116,15 +123,18 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=sent.message_id,
                 disable_notification=True,
             )
-            logger.info("Index message created and pinned.")
     except Exception as e:
         logger.error(f"Failed to update index: {e}")
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
+    # Start the web server in the background
+    threading.Thread(target=run_web, daemon=True).start()
+
+    # Start the bot
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
-    logger.info("Bot is running…")
+    logger.info("Bot and Web Server are running…")
     app.run_polling(allowed_updates=["channel_post"])
 
 if __name__ == "__main__":
