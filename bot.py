@@ -3,6 +3,7 @@ import re
 import logging
 import datetime
 import threading
+import asyncio
 from flask import Flask
 from pymongo import MongoClient
 from telegram import Update
@@ -130,6 +131,10 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     # Start the web server in the background
     threading.Thread(target=run_web, daemon=True).start()
+
+    # Create a new event loop for the Telegram bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     # Start the bot
     app = Application.builder().token(BOT_TOKEN).build()
